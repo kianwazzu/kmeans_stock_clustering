@@ -1,0 +1,237 @@
+---
+title: "Gather Stock Data"
+---
+headers
+```{r}
+library(tidyverse)
+library(ggfortify)
+library(NbClust)
+library(tidyquant)
+library(factoextra)
+library(ggplot2)
+library(yfinance)
+options(scipen = 99999999)
+```
+
+
+Get Data 
+```{r}
+library(yfinance)
+tickers <- read_csv("ticker_list.csv") 
+#get financial data from 2019-2021
+get_data_2019_2021 <- function(ticker){
+data <- get_financials(ticker)
+data <- data %>% filter(str_detect(date, "2019") | str_detect(date, "2021") )
+return(data)
+}
+
+get_data_catch_error <- function(ticker){
+  financials <- tryCatch(
+    {
+      ticker_data <- get_data_2019_2021(ticker)
+    },
+      error = 
+      {
+        ticker_data <- data_frame()
+      },
+    warn = 
+      {
+      ticker_data <- data_frame()
+      },
+      finally = 
+        {
+          return(ticker_data)
+        }
+  )
+  return(financials)
+}
+
+data <- data_frame()
+for(ticker in tickers$ticker){
+  financials <- get_data_catch_error(ticker)
+  data <- bind_rows(data, financials)
+}
+
+write_csv(data, "stock_financials_2019_2021.csv")
+
+
+#Get the stock prices for these dates.
+prices_2021 <- read_csv("NASDAQ_20220103.csv") %>% bind_rows(read_csv("NYSE_20220103.csv"))
+prices_2021 <- prices_2021 %>% select(Symbol, Close, Date)
+prices_2021 <- prices_2021 %>% filter(Symbol %in% tickers$ticker)
+
+
+#Get 2019 prices
+library(tidyquant)
+p2019_all <- data.frame()
+for(sym in tickers){
+  p2019 <- tq_get(sym, from = "2019-12-31", to = "2020-01-01")
+  if(!is.na(p2019)){
+    p2019_all <- bind_rows(p2019_all, p2019)
+  }
+  else{
+    Sys.sleep(1)
+  }
+}
+#Calculate price changes
+prices_joined <- prices_joined %>% mutate(change = (Close - adjusted) / adjusted)
+write_csv(prices_2019_2021, "price_changes_2019_2021.csv")
+
+#what does the "market" return during this period
+sp500 <- .52398
+```
+
+
+
+Cleaning Data and Normalizing
+```{r}
+data <- read_csv("stock_financials_2019_2021.csv")
+prices_2019_2021 <- read_csv("price_changes_2019_2021.csv")
+#some stocks for the same year got split up into multiple rows so add them back together
+cleaned <- data %>% group_by(ticker, date) %>% summarise(across(.fns = sum))
+
+cleaned <- data %>% group_by(ticker) %>% filter(n() == 2)
+#select the columns I want
+less_data <- cleaned %>% select(
+  ticker, date,
+  cash,  
+  totalCurrentAssets,
+  goodWill, 
+  totalAssets,
+  accountsPayable,
+  longTermDebt
+  , totalLiab, totalCurrentLiabilities,
+  retainedEarnings, totalStockholderEquity, netIncome,
+  totalCashflowsFromInvestingActivities, capitalExpenditures,
+  totalCashflowsFromInvestingActivities, dividendsPaid,
+  totalCashFromFinancingActivities, changeInCash, repurchaseOfStock,
+  issuanceOfStock, totalRevenue, costOfRevenue, grossProfit,
+  researchDevelopment, totalOperatingExpenses, operatingIncome, interestExpense, ebit
+)
+
+#filter to exclude stocks with erroneous and missing data for certain categories
+less_data <- less_data %>% filter( totalRevenue > 0 & !is.na(totalRevenue) & !is.na(totalAssets) & !is.na(cash) & !is.na(ebit) & !is.na(accountsPayable)
+                                  & !is.na(totalOperatingExpenses) & !is.na(totalLiab) & !is.na(retainedEarnings)  ) %>% group_by(ticker) %>% filter(n() > 1)
+
+
+#replace NA with 0
+less_data[is.na(less_data)] <- 0
+
+less_data <- less_data %>% arrange(ticker, date)
+
+
+three_year_difference <- less_data  %>%  
+  summarise(across(.cols = (-date), .fns = ~( . - lag(.) )/ lag(.)) )
+
+three_year_difference <- three_year_difference %>% filter(!is.na(cash))  
+  
+three_year_difference <- ungroup(three_year_difference)
+
+#replace the NaN with 0
+#thats the result of 0 divided by 0
+three_year_difference[is.na(three_year_difference)] <- 0
+
+
+finite_maximums <- three_year_difference
+#replace infinite with dummy value
+is.na(finite_maximums) <- sapply(finite_maximums, is.infinite)
+#should i replace the infinite values with the max? other values? how would that affect scaling/normalizing?
+#lets replace with the maximums
+replaced_maximums <- finite_maximums %>% 
+  mutate(across(everything(), ~replace_na(.x, max(.x, na.rm = TRUE))))
+
+#Join with the price changes over this time
+normalized_replaced_infinity <- normalized_replaced_infinity %>% left_join(prices_2019_2021, by = c("ticker" = "symbol")) %>% filter(!is.na(change))
+write_csv(normalized_replaced_infinity, "all_data.csv")
+
+```
+
+
+Read in Data
+```{r}
+data <- read_csv("all_data.csv")
+```
+
+K-Means Clustering Sizes
+```{r}
+#Best Cluster size
+Nb.clust.kmeans <- NbClust(data = data_prices_available[3:28], method = "kmeans")
+#How does the voting looks
+kmeans_clustersize <- Nb.clust.kmeans$Best.nc %>% as_tibble() 
+kmeans_clustersize <- kmeans_clustersize[1,] %>% pivot_longer(cols = everything()) %>% group_by(value) %>% summarise(votes = n())
+
+```
+
+
+Kmeans size 15
+```{r}
+kmeans15 <- kmeans(data_prices_available[3:28], centers = 15, nstart = 100)
+#look at the data by cluster
+kmeans15_data <- data_prices_available
+kmeans15_data$cluster <- kmeans15$cluster
+
+kmeans15_data <- kmeans15_data %>% mutate(positive = if_else(change > 0, 1, 0), beats_market = if_else(change > sp500, 1, 0))
+kmeans15_data_results<- kmeans15_data %>% group_by(cluster) %>% summarise(max_change = max(change), min_change = min(change), avg_change = mean(change),median_change = median(change) , percent_postive = sum(positive) / n(), percent_beats_market = sum(beats_market)/n(), size_of_cluster = n())
+
+#inside these clusters there are lots of clusters with only 1 or 2 data points
+
+#what do thees clusters look like
+autoplot(kmeans15, data = data_prices_available[3:28], frame = T ) + theme_minimal() + ggtitle("K = 15 Clustering by Principal Components")
+ggsave("k15_visual.jpg")
+
+#These results are very messy, lets look at a smaller number of clusters also
+```
+
+
+
+
+4 was also proposed as a size, lets try this clustering
+```{r}
+kmeans4 <- kmeans(data_prices_available[3:28], centers = 4, nstart = 100 )
+
+#look at the data by cluster
+kmeans4_data <- data_prices_available
+kmeans4_data$cluster <- kmeans4$cluster
+
+kmeans4_data <- kmeans4_data %>% mutate(positive = if_else(change > 0, 1, 0), beats_market = if_else(change > sp500, 1, 0))
+kmeans4_data_results<- kmeans4_data %>% group_by(cluster) %>% summarise(max_change = max(change), min_change = min(change), avg_change = mean(change),median_change = median(change) , percent_postive = sum(positive) / n(), percent_beats_market = sum(beats_market)/n(), size_of_cluster = n())
+
+#inside these clusters there are lots of clusters with only 1 or 2 data points
+
+#what do thees clusters look like
+autoplot(kmeans4, data = data_prices_available[3:28], frame = T, ) + theme_minimal() + ggtitle("K = 4 Clustering by Principal Components")
+ggsave("k4_visual.jpg")
+
+```
+
+Principal Component Analysis
+```{r}
+pca <- prcomp(data[3:28], retx = T,scale. = F)
+eig.val <- get_eigenvalue(pca)
+
+res.var <- get_pca_var(pca)
+res.ind <- get_pca_ind(pca)
+res.ind$coord
+fviz_pca(pca)
+```
+new
+```{r}
+new_data <- kmeans4_data %>% filter(cluster == 1 | cluster == 3)
+new_nb <- NbClust::NbClust(new_data[3:28], method = "kmeans")
+
+k7 <- new_nb$Best.partition
+table(k7)
+new_data$cluster <- new_nb$Best.partition
+new_results <- new_data %>% group_by(cluster) %>%  summarise(max_change = max(change), min_change = min(change), avg_change = mean(change),median_change = median(change) , percent_postive = sum(positive) / n(), percent_beats_market = sum(beats_market)/n(), size = n())
+
+new_data <- new_data %>% group_by(cluster) %>% mutate(size = n())
+new_data <- new_data %>% filter(size > 1)
+new_nb <- NbClust(new_data[3:28], method = "kmeans")
+
+k4 <- new_nb$Best.partition
+table(k4)
+new_data$cluster <- new_nb$Best.partition
+new_results <- new_data %>% group_by(cluster) %>%  summarise(max_change = max(change), min_change = min(change), avg_change = mean(change),median_change = median(change) , percent_postive = sum(positive) / n(), percent_beats_market = sum(beats_market)/n(), size = n())
+```
+
+
